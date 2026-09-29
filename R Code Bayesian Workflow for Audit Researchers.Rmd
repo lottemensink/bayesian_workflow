@@ -1,0 +1,1160 @@
+---
+title: 'R Code: Bayesian Workflow for Audit Researchers'
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r loading packages, include = FALSE}
+library(dplyr)
+library(stringr)
+library(stringdist)
+library(rstan)
+library(ggplot2)
+library(bayesplot)
+library(gridExtra)
+library(loo)
+library(ggpubr)
+library(brms)
+library(knitr)
+```
+
+This Markdown file accompanies the manuscript "Developing and Evaluating Bayesian Models in Audit Research: A Practical Workflow". In this file, we will present the application of the Bayesian workflow using the audit fee data set in R code. We will fit three different models, and for every model we answer three questions:
+
+1.  Is the model consistent with domain knowledge?
+
+2.  Is the posterior approximation sufficiently accurate?
+
+3.  Does the model reproduce the relevant patterns in the data?
+
+Before fitting any models, we will describe the data. 
+
+# The Data
+
+The data used for illustrating the Bayesian workflow is extracted from the EDGAR database and contains information on audit fees, total assets, and firm identifiers. Additionally, we incorporate audit complexity data from XBRL Research to examine the relationship between audit complexity and audit fees.
+
+```{r preprocessing, include = FALSE}
+# load data extracted from Edgar (firms, audit fees, total assets, etc.)
+data_fees <- read.csv("EdgarUSD.csv")
+data_fees$adsh <- data_fees$accession_number
+# load audit complexity data from XBRL Research
+# this file can be obtained from https://www.xbrlresearch.com/#firm-complexity
+# download "Firm Complexity (ARC) Data" in Excel format
+data_compl <- read.csv("ARC.csv", sep = ";")
+# filter the 20-F statements out of the complexity data
+data_compl <- data_compl[data_compl$form == "20-F", ]
+# join the complexity data to the audit fee data using adsh
+merged_data <- data_fees %>%
+  inner_join(data_compl, by = "adsh")
+# omit NA's
+filtered_data1 <- na.omit(merged_data)
+# clean entity names
+entity_clean <- filtered_data1$EntityName |>
+  str_to_upper() |>
+  str_replace_all("[[:punct:]]", " ") |>
+  str_replace_all("\\bLIMITED\\b", "LTD") |>
+  str_squish()
+# create mapping for double entity names
+crosswalk <- c(
+  "INTERCONTINENTAL HOTELS GROUP PLC NEW" = "INTERCONTINENTAL HOTELS GROUP PLC",
+  "TELEFÓNICA S A" = "TELEFONICA S A",
+  "CHINA SOUTHERN AIRLINES CO LTD" = "CHINA SOUTHERN AIRLINES COMPANY LTD",
+  "SINOPEC SHANGHAI PETROCHEMICAL COMPANY LTD" = "SINOPEC SHANGHAI PETROCHEMICAL CO LTD", 
+  "AEGON LTD" = "AEGON NV", 
+  "CHINA PETROLEUM CHEMICAL CORP" = "CHINA PETROLEUM CHEMICAL CORPORATION", 
+  "COCA COLA EUROPEAN PARTNERS PLC" = "COCA COLA EUROPACIFIC PARTNERS PLC", 
+  "FRESENIUS MEDICAL CARE AG CO KGAA" = "FRESENIUS MEDICAL CARE AG", 
+  "GUANGSHEN RAILWAY COMPANY LTD" = "GUANGSHEN RAILWAY CO LTD", 
+  "VODAFONE GROUP PUBLIC LTD COMPANY" = "VODAFONE GROUP PUBLIC LTD CO", 
+  "ROYAL DUTCH SHELL PLC" = "SHELL PLC", 
+  "CHINA LIFE INSURANCE COMPANY LTD" = "CHINA LIFE INSURANCE CO LTD", 
+  "GLAXOSMITHKLINE PLC" = "GSK PLC",
+  "EQUINOR ASA" = "STATOIL ASA", 
+  "PRANA BIOTECHNOLOGY LTD" = "ALTERITY THERAPEUTICS LTD", 
+  "BHP BILLITON LTD" = "BHP GROUP LTD"
+)
+# recode entity names using the mapping
+filtered_data1$EntityName_clean <-
+  dplyr::recode(entity_clean, !!!crosswalk)
+
+# remove negative observations for TA and audit fees
+filtered_data2 <- filtered_data1 %>%
+  filter(AuditFeesUSD > 0 & TotalAssetsUSD > 0)
+
+# code entity name clean as category
+filtered_data2$Firm <- as.factor(filtered_data2$EntityName_clean)
+
+# keep only the columns audit fees, ARC, Firm & TA
+filtered_data2 <- filtered_data2 %>%
+  select(adsh, AuditFeesUSD, ARC, Firm, TotalAssetsUSD, AuditFees, FiscalYearFocus, EntityName_clean) 
+
+# remove observations based on manual checking with records (parsing errors)
+to_remove <- c("0001956827-25-000010", "0001292814-25-000697", "0001493152-22-024334",
+               "0000835403-20-000006", "0000835403-19-000005", "0001193125-20-065064",
+               "0001104659-26-035163", "0001558370-25-003806", "0001628280-25-015363", 
+               "0001062993-23-013696", "0001047469-21-000424", "0000217410-26-000007", 
+               "0000217410-24-000017", "0000217410-25-000015", "0000217410-23-000016", 
+               "0000217410-22-000009", "0001193125-21-075770", "0001193125-20-067343", 
+               "0001193125-19-070417", "0001558370-20-003378", "0001213900-22-066882",
+               "0001193125-20-128655", "0001193125-19-121544", "0001193125-18-141442", 
+               "0000919574-20-002350", "0001104659-24-038836", "0001193125-26-194102")
+
+# correct audit fees based on manual checking with records (parsing errors)
+filtered_data2[filtered_data2$adsh == "0001213900-25-044434", "AuditFeesUSD"] <- 220740
+filtered_data2[filtered_data2$adsh == "0001213900-24-062719", "AuditFeesUSD"] <- 203000
+filtered_data2[filtered_data2$adsh == "0001213900-24-043254", "AuditFeesUSD"] <- 210000
+filtered_data2[filtered_data2$adsh == "0001213900-22-026185", "AuditFeesUSD"] <- 250000
+
+# remove adsh from final data 
+filtered_data3 <- filtered_data2[!filtered_data2$adsh %in% to_remove, ]
+
+final_data <- filtered_data3 %>%
+  group_by(Firm) %>%
+  filter(n() > 1) %>%
+  ungroup()
+
+final_data$Firm <- droplevels(final_data$Firm)
+final_data$FirmNumber <- as.numeric(final_data$Firm)
+
+TA_transformed <- (log(final_data$TotalAssetsUSD) - mean(log(final_data$TotalAssetsUSD))) / sd(log(final_data$TotalAssetsUSD))
+ARC_transformed <- (log(final_data$ARC) - mean(log(final_data$ARC))) / sd(log(final_data$ARC))
+```
+
+## Sample Selection Table
+
+The following table summarizes the sample selection process, including the number of observations at each step of the data cleaning and filtering process.
+
+```{r sample selection table, echo = FALSE}
+sample_selection <- data.frame(c(
+    "Initial audit fee observations extracted from EDGAR",
+    "Observations matched to audit complexity data",
+    "Less: Observations with missing values",
+    "Less: Observations with non-positive audit fees or total assets",
+    "Less: Observations identified for exclusion after review of the underlying filings",
+    "Less: Firms with only one observation",
+    "Final sample"
+  ), c(
+    nrow(data_fees),
+    nrow(merged_data),
+    nrow(merged_data) - nrow(filtered_data1),
+    nrow(filtered_data1) - nrow(filtered_data2),
+    nrow(filtered_data2) - nrow(filtered_data3),
+    nrow(filtered_data3) - nrow(final_data),
+    nrow(final_data)
+  )
+)
+
+kable(sample_selection, col.names = c("Sample selection criterion", "Observations"))
+```
+
+## Descriptive Statistics
+
+```{r descriptives, echo = FALSE}
+summary_table <- data.frame(
+  Variable = c(
+    "Audit fees (USD millions)",
+    "Total assets (USD millions)",
+    "Firm complexity (ARC)"
+  ),
+  Mean = c(
+    mean(final_data$AuditFeesUSD) / 1e6,
+    mean(final_data$TotalAssetsUSD) / 1e6,
+    mean(final_data$ARC)
+  ),
+  SD = c(
+    sd(final_data$AuditFeesUSD) / 1e6,
+    sd(final_data$TotalAssetsUSD) / 1e6,
+    sd(final_data$ARC)
+  )
+)
+
+kable(summary_table)
+```
+
+
+# Initial model: Accounting for firm-level heterogeneity in audit fees
+
+With the data we have collected, we aim to explain how firm complexity affects audit fees. Because firms may differ in ways that are not captured by our observed variables, we include firm-specific intercepts to account for persistent differences between firms. Furthermore, we include total assets to control for firm size, as larger firms generally require more audit effort and are therefore expected to incur higher audit fees. This yields the following model specification: 
+
+$$
+\begin{aligned}
+LN(AF_{it}) &\sim N(\mu_{it}, \sigma), \\
+\mu_{it} &= \alpha_i + \beta_{ARC} \cdot LN(ARC)_{it}^{std} + \beta_{TA} \cdot LN(TA)_{it}^{std} \\
+\alpha_i &\sim N(13.892,1.299),\\
+\beta_{ARC} &\sim N(0,10), \\
+\beta_{TA} &\sim N(0,10),\\
+\sigma &\sim N^+(0,10).
+\end{aligned}
+$$
+
+In Rstan, we can represent this model specification using the following code. 
+
+```{r model specification 1, results = 'hide', warning = FALSE, message = FALSE}
+specmodel1 <- "data {
+    int<lower=0> N;                   // number of observations
+    int<lower=0> K;                   // number of predictors
+    int<lower=0> J;                   // number of firms
+    int<lower=1, upper=J> firm[N];    // firm ID
+    matrix[N, K] x;                   // predictor matrix with ARC and TA    
+    vector[N] AF;                     // dependent variable
+  }
+  
+  parameters {
+    vector[J] alpha;                  // firm-specific intercepts
+    vector[K] beta;                   // coefficients for predictors
+    real<lower=0> sigma;              // standard deviation of the residuals
+  }
+  
+  model {
+    // data model
+    AF ~ normal(alpha[firm] + x * beta, sigma);
+    // prior distributions
+    alpha ~ normal(13.892, 1.299); 
+    beta ~ normal(0,10);
+    sigma ~ normal(0,10);
+  }
+  
+  generated quantities { 
+  // posterior predictive simulations
+  vector[N] AF_sim;
+  
+  // log-likelihood for LOO-CV
+  vector[N] log_lik;
+  
+  for (i in 1:N){
+    AF_sim[i] = normal_rng(alpha[firm[i]] + x[i, ] * beta, sigma);
+    log_lik[i] = normal_lpdf(AF[i] | alpha[firm[i]] + x[i, ] * beta, sigma);
+  }
+  }
+"
+
+model1 <- rstan::stan_model(model_code = specmodel1)
+```
+
+## Is the model consistent with domain knowledge?
+
+```{r prior predictive model 1 diffuse, echo = FALSE, results = 'hide', warning = FALSE, message = FALSE}
+specmodel1_pp_diffuse <- "data {
+    int<lower=0> N;                   // number of observations
+    int<lower=0> K;                   // number of predictors
+    int<lower=0> J;                   // number of firms
+    int<lower=1, upper=J> firm[N];    // firm ID
+    matrix[N, K] x;                   // predictor matrix with ARC and TA    
+    // vector[N] AF;                     // dependent variable
+  }
+  
+  parameters {
+    vector[J] alpha;                  // firm-specific intercepts
+    vector[K] beta;                   // coefficients for predictors
+    real<lower=0> sigma;              // standard deviation of the residuals
+  }
+  
+  model {
+    // data model
+    // AF ~ normal(alpha[firm] + x * beta, sigma);
+    // prior distributions
+    alpha ~ normal(13.892, 1.299); 
+    beta ~ normal(0,10);
+    sigma ~ normal(0,10);
+  }
+  
+  generated quantities { 
+  // posterior predictive simulations
+  vector[N] AF_sim;
+  
+  // log-likelihood for LOO-CV
+  // vector[N] log_lik;
+  
+  for (i in 1:N){
+    AF_sim[i] = normal_rng(alpha[firm[i]] + x[i, ] * beta, sigma);
+    // log_lik[i] = normal_lpdf(AF[i] | alpha[firm[i]] + x[i, ] * beta, sigma);
+  }
+  }
+"
+
+model1_pp_diffuse <- rstan::stan_model(model_code = specmodel1_pp_diffuse)
+
+fit1_pp_diffuse <- rstan::sampling(model1_pp_diffuse, data = list(N = nrow(final_data), 
+                                           K = 2,
+                                           J = length(unique(final_data$FirmNumber)), 
+                                           firm = final_data$FirmNumber,
+                                           x = cbind(ARC_transformed, TA_transformed)
+                                           ),
+                iter = 5000, chains = 4, refresh = 0, seed = 123, cores = 4, 
+                warmup = 1000)
+
+AF_sim_1_diffuse <- as.vector(rstan::extract(fit1_pp_diffuse)$AF_sim)
+
+breaks <- seq(
+  log(1),
+  log(1e12),
+  length.out = 36
+)
+
+pp_diffuse <- ggplot() +
+  geom_histogram(
+    data = data.frame(AF_sim = AF_sim_1_diffuse),
+    aes(x = AF_sim),
+    fill = "#6497b1",
+    color = "#03396c",
+    breaks = breaks
+  )+
+  theme_classic() + 
+    scale_x_continuous(
+    breaks = log(c(1, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12)),
+    labels = c("$1", "$10", "$100", "$1K", "$10K", "$100K", "$1M", "$10M", "$100M", "$1B", "$10B", "$100B", "$1T")
+  ) +
+  coord_cartesian(xlim = range(log(final_data$AuditFeesUSD)) + c(-10, 10)) +
+  # add vertical lines for observed data range
+  labs(x = "Audit Fees (log scale, dollar labels)",
+       y = "") +
+  geom_vline(xintercept = log(c(1000, 200000000)), color = "red", linetype = "dashed") +
+  theme(text = element_text(size = 14), axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+outside_range <- sum(AF_sim_1_diffuse < log(1000) | AF_sim_1_diffuse > log(200000000)) / length(AF_sim_1_diffuse)
+```
+
+```{r, echo = FALSE}
+print(pp_diffuse)
+print(paste("Proportion of simulated audit fees outside the plausible range: ", round(outside_range, 4)))
+```
+
+
+Because the prior predictive distribution of the model with diffuse priors generates a substantial proportion of simulated audit fees outside the plausible range, we conclude that the model is not in line with the domain knowlegde about audit fees. We modify the prior distributions to be weakly informative, by substituting the $N(0, 10)$ priors for the coefficients with $N(0, 1)$ priors.
+
+
+```{r prior predictive model 1 weakly informative, echo = FALSE, results = 'hide', warning = FALSE, message = FALSE}
+specmodel1_pp_wi <- "data {
+    int<lower=0> N;                   // number of observations
+    int<lower=0> K;                   // number of predictors
+    int<lower=0> J;                   // number of firms
+    int<lower=1, upper=J> firm[N];    // firm ID
+    matrix[N, K] x;                   // predictor matrix with ARC and TA    
+    // vector[N] AF;                     // dependent variable
+  }
+  
+  parameters {
+    vector[J] alpha;                  // firm-specific intercepts
+    vector[K] beta;                   // coefficients for predictors
+    real<lower=0> sigma;              // standard deviation of the residuals
+  }
+  
+  model {
+    // data model
+    // AF ~ normal(alpha[firm] + x * beta, sigma);
+    // prior distributions
+    alpha ~ normal(13.892, 1.299); 
+    beta ~ normal(0,1);
+    sigma ~ normal(0,1);
+  }
+  
+  generated quantities { 
+  // posterior predictive simulations
+  vector[N] AF_sim;
+  
+  // log-likelihood for LOO-CV
+  // vector[N] log_lik;
+  
+  for (i in 1:N){
+    AF_sim[i] = normal_rng(alpha[firm[i]] + x[i, ] * beta, sigma);
+    // log_lik[i] = normal_lpdf(AF[i] | alpha[firm[i]] + x[i, ] * beta, sigma);
+  }
+  }
+"
+
+model1_pp_wi <- rstan::stan_model(model_code = specmodel1_pp_wi)
+
+fit1_pp_wi <- rstan::sampling(model1_pp_wi, data = list(N = nrow(final_data), 
+                                           K = 2,
+                                           J = length(unique(final_data$FirmNumber)), 
+                                           firm = final_data$FirmNumber,
+                                           x = cbind(ARC_transformed, TA_transformed)
+                                           ),
+                iter = 5000, chains = 4, refresh = 0, seed = 123, cores = 4, 
+                warmup = 1000)
+
+AF_sim_1_wi <- as.vector(rstan::extract(fit1_pp_wi)$AF_sim)
+
+pp_wi <- ggplot() +
+  geom_histogram(
+    data = data.frame(AF_sim = AF_sim_1_wi),
+    aes(x = AF_sim),
+    fill = "#6497b1",
+    color = "#03396c",
+    breaks = breaks
+  )+
+  theme_classic() + 
+    scale_x_continuous(
+    breaks = log(c(1, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12)),
+    labels = c("$1", "$10", "$100", "$1K", "$10K", "$100K", "$1M", "$10M", "$100M", "$1B", "$10B", "$100B", "$1T")
+  ) +
+  coord_cartesian(xlim = range(log(final_data$AuditFeesUSD)) + c(-10, 10)) +
+  # add vertical lines for observed data range
+  labs(x = "Audit Fees (log scale, dollar labels)",
+       y = "") +
+  geom_vline(xintercept = log(c(1000, 200000000)), color = "red", linetype = "dashed") +
+  theme(text = element_text(size = 14), axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+outside_range <- sum(AF_sim_1_wi < log(1000) | AF_sim_1_wi > log(200000000)) / length(AF_sim_1_wi)
+```
+
+```{r, echo = FALSE}
+print(pp_wi)
+print(paste("Proportion of simulated audit fees outside the plausible range: ", round(outside_range, 4)))
+```
+
+The prior predictive distribution is now much more in line with what we would expect based on domain knowledge. 
+
+```{r, include = FALSE}
+ggsave(pp_diffuse, filename = "prior_predictive_distribution_diffuse.png", width = 8, height = 6)
+ggsave(pp_wi, filename = "prior_predictive_distribution_wi.png", width = 8, height = 6)
+```
+
+
+## Is the posterior approximation sufficiently accurate?
+
+After checking whether the model reflects what we know, it is time to fit the model to the observed data. To illustrate what happens when the specified priors are not appropriate for the scale of the predictors, we first estimate the model using unstandardized predictors. 
+
+```{r model fit unstandardized, echo = FALSE, results = 'hide'}
+fit1_unscaled <- rstan::sampling(model1, data = list(N = nrow(final_data), 
+                                           K = 2,
+                                           J = length(unique(final_data$FirmNumber)), 
+                                           firm = final_data$FirmNumber,
+                                           x = cbind(log(final_data$ARC), 
+                                                     log(final_data$TotalAssetsUSD)),
+                                           AF = log(final_data$AuditFeesUSD)
+                                           ),
+                iter = 10000, chains = 4, refresh = 0, seed = 123, cores = 4, 
+                warmup = 2000, control = list(adapt_delta = 0.99, max_treedepth = 17))
+```
+
+```{r, echo = FALSE}
+print(fit1_unscaled, pars = c("beta[1]", "beta[2]", "sigma"), probs = c(0.025, 0.5, 0.975))
+```
+
+
+Looking at the model fit summary, all $\hat{R}$-values are equal to 1, which indicates that the chains have mixed well. We can further investigate the model fit with a pairs plot. 
+
+```{r pairs unstandardized, echo = FALSE, results = 'hide'}
+draws <- as.array(fit1_unscaled)
+
+dimnames(draws)$parameters[
+  dimnames(draws)$parameters %in% c("beta[1]", "beta[2]")
+] <- c("beta_ARC", "beta_TA")
+
+pairs_unscaled <- mcmc_pairs(
+  draws,
+  pars = c("beta_TA", "beta_ARC", "sigma")
+)
+
+print(pairs_unscaled)
+```
+
+The pairs plot shows a high posterior correlation between the regression coefficients. This indicates there is a problem with our estimation. To solve this problem, we can standardize the predictors. This yields the following model fit summary.
+
+```{r model fit standardized, echo = FALSE, results = 'hide'}
+fit1 <- rstan::sampling(model1, data = list(N = nrow(final_data), 
+                                           K = 2,
+                                           J = length(unique(final_data$FirmNumber)), 
+                                           firm = final_data$FirmNumber,
+                                           x = cbind(ARC_transformed, TA_transformed),
+                                           AF = log(final_data$AuditFeesUSD)
+                                           ),
+                iter = 10000, chains = 4, refresh = 0, seed = 123, cores = 4, 
+                warmup = 2000, control = list(adapt_delta = 0.99, max_treedepth = 17))
+```
+
+
+```{r, echo = FALSE}
+print(fit1, pars = c("beta[1]", "beta[2]", "sigma"), probs = c(0.025, 0.5, 0.975))
+```
+
+Again, $\hat{R}$-values are equal to 1. Furthermore, inspecting the pairs plots, we can observe that the parameters are now estimated independently. 
+
+```{r pairs standardized, echo = FALSE}
+draws <- as.array(fit1)
+
+dimnames(draws)$parameters[
+  dimnames(draws)$parameters %in% c("beta[1]", "beta[2]")
+] <- c("beta_ARC", "beta_TA")
+
+pairs_scaled <- mcmc_pairs(
+  draws,
+  pars = c("beta_TA", "beta_ARC", "sigma")
+)
+
+print(pairs_scaled)
+```
+
+```{r, include = FALSE}
+ggsave(pairs_unscaled, filename = "pairs_model1_unscaled.png", width = 4, height = 4)
+ggsave(pairs_scaled, filename = "pairs_model1_scaled.png", width = 4, height = 4)
+```
+
+After standardizing the predictors, the model estimation seems to be sufficiently accurate. To verify this more thoroughly, we also provide the results of the simulation-based calibration (SBC). 
+
+```{r sbc model 1, echo = FALSE}
+load("sbc_results1.RData")
+
+n_posterior_draws <- 100
+
+ggplot(results_long, aes(x = rank)) +
+  geom_histogram(
+  fill = "lightblue",
+  color = "black", 
+  breaks = seq(0, n_posterior_draws, by = 10)
+  ) +
+  facet_wrap(~ parameter) +
+  coord_cartesian(xlim = c(0, n_posterior_draws)) +
+  labs(
+    title = "SBC Rank Histograms",
+    x = "Rank statistic",
+    y = "Count"
+  ) +
+  theme_classic() +
+  theme(
+    text = element_text(family = "serif", size = 18)
+  ) + 
+  geom_hline(aes(yintercept = 50), linetype = "dotted")
+```
+
+The histograms are approximately uniform. There are some slight deviations from the uniform distribution, but these are to be expected given that the SBC procedure was based on 500 simulations. 
+
+##  Does the model reproduce the relevant patterns in the data?
+
+To assess whether the model reproduces the relevant patterns in the observed data, we inspect the posterior predictive distribution. 
+
+```{r posterior predictive model 1, echo = FALSE}
+y_rep1 <- rstan::extract(fit1)$AF_sim
+ppc1 <- ppc_dens_overlay(log(final_data$AuditFeesUSD), y_rep1[1:100, ]) + 
+  xlab("Log Audit Fees")
+print(ppc1)
+```
+
+The posterior predictive distribution seems to capture the most important features of the observed data.
+
+```{r, include = FALSE}
+ggsave(ppc1, filename = "ppc1.png", width = 6, height = 3)
+```
+
+# Extension: Borrowing information across firms about firm-level audit fees 
+
+We extend the initial model to allow for information-sharing about firm-level audit fees between firms. This yields the following model specification: 
+
+$$
+\begin{aligned}
+LN(AF_{it}) &\sim N(\mu_{it},\sigma),\\
+\mu_{it} &= \alpha_i
++ \beta_{ARC} \cdot LN(ARC)_{it}^{std}
++ \beta_{TA} \cdot LN(TA)_{it}^{std},\\
+\alpha_i &\sim N(\mu_\alpha,\sigma_\alpha),\\
+\mu_\alpha &\sim N(13.892,1.299),\\
+\beta_{ARC} &\sim N(0,1), \\
+\beta_{TA} &\sim N(0,1),\\
+\sigma_\alpha &\sim N^+(0,1), \\
+\sigma &\sim N^+(0,1).
+\end{aligned}
+$$
+
+In Rstan, we can represent this model specification using the following code. 
+
+```{r model specification 2, results = 'hide', warning = FALSE, message = FALSE}
+specmodel2 <- "data {
+    int<lower=0> N;       // number of observations
+    int<lower=0> K;       // number of predictors
+    int<lower=0> J;       // number of firms
+    int<lower=1, upper=J> firm[N]; // firm ID
+    matrix[N, K] x;       // predictor matrix with ARC and TA 
+    vector[N] AF;         // dependent variable
+  }
+  
+  parameters {
+    vector[J] alpha;          // firm-specific intercepts
+    vector[K] beta;           // coefficients for predictors
+    real<lower=0> sigma;      // standard deviation of the residuals 
+    real mu_alpha;             // hyperparameter for alpha
+    real<lower=0> sigma_alpha; // hyperparameter for alpha
+  }
+  
+  model {
+    // data model
+    AF ~ normal(alpha[firm] + x * beta, sigma);
+    // priors
+    alpha ~ normal(mu_alpha, sigma_alpha); 
+    beta ~ normal(0,1);
+    sigma ~ normal(0,1);
+    mu_alpha ~ normal(13.892, 1.299);
+    sigma_alpha ~ normal(0, 1);
+  }
+  generated quantities { 
+  // posterior predictive simulations 
+  vector[N] AF_sim;
+  
+  // log-likelihood for LOO-CV
+  vector[N] log_lik;
+  
+  for (i in 1:N){
+    AF_sim[i] = normal_rng(alpha[firm[i]] + x[i, ] * beta, sigma);
+    log_lik[i] = normal_lpdf(AF[i] | alpha[firm[i]] + x[i, ] * beta, sigma);
+  }
+  }
+"
+
+model2 <- rstan::stan_model(model_code = specmodel2)
+```
+
+## Is the model consistent with domain knowledge?
+
+To assess whether the model is consistent with domain knowledge, we generate a prior predictive distribution. 
+
+```{r prior predictive distribution model 2, echo = FALSE, results = 'hide', warning = FALSE, message = FALSE}
+specmodel2_pp <- "data {
+    int<lower=0> N;       // number of observations
+    int<lower=0> K;       // number of predictors
+    int<lower=0> J;       // number of firms
+    int<lower=1, upper=J> firm[N]; // firm
+    matrix[N, K] x;       // predictor matrix    
+    // vector[N] AF;         // dependent variable
+  }
+  
+  parameters {
+    vector[J] alpha;          // firm-specific intercepts
+    vector[K] beta;           // coefficients for predictors
+    real<lower=0> sigma;      // standard deviation of the residuals 
+    real mu_alpha;             // hyperparameter for alpha
+    real<lower=0> sigma_alpha; // hyperparameter for alpha
+  }
+  
+  model {
+    // AF ~ normal(alpha[firm] + x * beta, sigma);
+    alpha ~ normal(mu_alpha, sigma_alpha); 
+    beta ~ normal(0,1);
+    sigma ~ normal(0,1);
+    mu_alpha ~ normal(13.892, 1.299);
+    sigma_alpha ~ normal(0, 1);
+  }
+  generated quantities { 
+  vector[N] AF_sim;
+  // vector[N] log_lik;
+  
+  for (i in 1:N){
+    AF_sim[i] = normal_rng(alpha[firm[i]] + x[i, ] * beta, sigma);
+    // log_lik[i] = normal_lpdf(AF[i] | alpha[firm[i]] + x[i, ] * beta, sigma);
+  }
+  }
+"
+
+model2_pp <- rstan::stan_model(model_code = specmodel2_pp)
+
+fit2_pp <- rstan::sampling(model2_pp, data = list(N = nrow(final_data), 
+                                           K = 2,
+                                           J = length(unique(final_data$FirmNumber)), 
+                                           firm = final_data$FirmNumber,
+                                           x = cbind(ARC_transformed, TA_transformed)),
+                iter = 5000, chains = 4, refresh = 0, seed = 123, cores = 4, 
+                warmup = 1000)
+
+AF_sim_2 <- as.vector(rstan::extract(fit2_pp)$AF_sim)
+
+pp_2 <- ggplot() +
+  geom_histogram(
+    data = data.frame(AF_sim = AF_sim_2),
+    aes(x = AF_sim),
+    fill = "#6497b1",
+    color = "#03396c",
+    breaks = breaks
+  )+
+  theme_classic() + 
+    scale_x_continuous(
+    breaks = log(c(1, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12)),
+    labels = c("$1", "$10", "$100", "$1K", "$10K", "$100K", "$1M", "$10M", "$100M", "$1B", "$10B", "$100B", "$1T")
+  ) +
+  coord_cartesian(xlim = range(log(final_data$AuditFeesUSD)) + c(-10, 10)) +
+  # add vertical lines for observed data range
+  labs(x = "Audit Fees (log scale, dollar labels)", y = "") +
+  geom_vline(xintercept = log(c(1000, 200000000)), color = "red", linetype = "dashed") +
+  theme(text = element_text(size = 14), axis.text.x = element_text(angle = 45, hjust = 1), axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+outside_range_2 <- sum(AF_sim_2 < log(1000) | AF_sim_2 > log(200000000)) / length(AF_sim_2)
+```
+
+```{r, echo = FALSE}
+print(pp_2)
+print(paste("Proportion of simulated audit fees outside the plausible range: ", round(outside_range_2, 4)))
+```
+
+The prior predictive distribution shows that the range of audit fees implied by this model falls largely within the plausible range. 
+
+```{r}
+ggsave(pp_2, filename = "prior_predictive_distribution_model2.png", width = 8, height = 6)
+```
+
+## Is the posterior approximation sufficiently accurate?
+
+To assess whether the posterior approximation is sufficiently accurate, we inspect the model fit summary and make pairs plots. 
+
+```{r fit model 2, echo = FALSE, results = 'hide'}
+fit2 <- sampling(
+    model2,
+    data = list(
+        N = nrow(final_data),
+        K = 2,
+        J = length(unique(final_data$Firm)),
+        firm = final_data$FirmNumber,
+        x = cbind(ARC_transformed, TA_transformed),
+        AF = log(final_data$AuditFeesUSD)),
+    chains = 4, iter = 10000, warmup = 2000, cores = 4, refresh = 0,
+    control = list(adapt_delta = 0.99, max_treedepth = 17))
+```
+
+```{r, echo = FALSE}
+print(fit2, pars = c("beta", "sigma", "mu_alpha", "sigma_alpha"), probs = c(0.025, 0.5, 0.975))
+```
+
+```{r pairs plot model 2, echo = FALSE}
+draws <- as.array(fit2)
+
+dimnames(draws)$parameters[
+  dimnames(draws)$parameters %in% c("beta[1]", "beta[2]")
+] <- c("beta_ARC", "beta_TA")
+
+pairs2 <- mcmc_pairs(
+  draws,
+  pars = c("beta_TA", "beta_ARC", "mu_alpha", "sigma_alpha", "sigma")
+)
+
+print(pairs2)
+```
+
+```{r, include = FALSE}
+ggsave(pairs2, filename = "pairs_model2.png", width = 12, height = 6)
+```
+
+Based on the model fit summary and the pairs plot, the model estimation seems to be trustworthy. To verify this more thoroughly, we also provide the results of the simulation-based calibration (SBC). 
+
+```{r sbc model 2, echo = FALSE}
+load("sbc_results2.RData")
+
+ggplot(results_long, aes(x = rank)) +
+  geom_histogram(
+  fill = "lightblue",
+  color = "black", 
+  breaks = seq(0, n_posterior_draws, by = 10)
+  ) +
+  facet_wrap(~ parameter) +
+  coord_cartesian(xlim = c(0, n_posterior_draws)) +
+  labs(
+    title = "SBC Rank Histograms",
+    x = "Rank statistic",
+    y = "Count"
+  ) +
+  theme_classic() +
+  theme(
+    text = element_text(family = "serif", size = 18)
+  ) + 
+  geom_hline(aes(yintercept = 50), linetype = "dotted")
+```
+
+The histograms are approximately uniform. There are some slight deviations from the uniform distribution, but these are to be expected given that SBC procedure was based on 500 simulations. 
+
+##  Does the model reproduce the relevant patterns in the data?
+
+To assess whether the model reproduces the relevant patterns in the observed data, we inspect the posterior predictive distribution. 
+
+```{r posterior predictive model 2, echo = FALSE}
+y_rep2 <- rstan::extract(fit2)$AF_sim
+ppc2 <- ppc_dens_overlay(log(final_data$AuditFeesUSD), y_rep2[1:100, ]) +
+  xlab("Log Audit Fees")
+print(ppc2)
+```
+
+```{r, include = FALSE}
+ggsave(ppc2, filename = "ppc2.png", width = 6, height = 3)
+```
+
+The model seems to reproduce the features of the observed data. To get a better idea about the model fit in relation to the other models, we perform LOO-CV model comparison. 
+
+```{r loocv model 1 and 2, echo = FALSE, warning = FALSE}
+loglik1 <- loo::extract_log_lik(fit1, parameter_name = "log_lik")
+loo1 <- loo(loglik1, moment_match = TRUE)
+loo1_mm <- loo_moment_match(fit1, loo1)
+
+loglik2 <- loo::extract_log_lik(fit2, parameter_name = "log_lik")
+loo2 <- loo(loglik2, moment_match = TRUE)
+loo2_mm <- loo_moment_match(fit2, loo2)
+
+comparison <- loo_compare(loo1_mm, loo2_mm)
+
+kable(comparison[,c(1:4,7,8)])
+```
+
+Finally, we calculate the pooling factor for this model, which measures the extent to which information about the intercept estimate for baseline audit fees is shared across firms. We first calculate the firm-specific deviations from the population-level intercept for each posterior draw,
+
+$$
+\epsilon_i = \alpha_{i} - \mu_{\alpha}.
+$$
+
+We then calculate two quantities. First, for each firm $i$, we calculate the posterior mean of $\epsilon_i$, $E(\epsilon_i)$, and then calculate the variance of these 119 firm-specific posterior means. Second, for each posterior draw, we calculate the variance of $\epsilon_i$ across the 119 firms and then take the average of these variances across the 32,000 posterior draws.
+
+The pooling factor is then calculated as
+
+$$
+\lambda = 1-\frac{\operatorname{Var}(E(\epsilon_i))}
+{E[\operatorname{Var}(\epsilon_i)]}.
+$$
+
+For more information, we refer to Gelman & Pardoe (2006). 
+
+```{r pooling factor model 2, include = FALSE}
+samples <- rstan::extract(fit2)
+theta_i <- samples$alpha
+mu <- samples$mu_alpha
+epsilon_i <- sweep(theta_i, 1, mu, "-")
+pooling_factor <- 1 - var(apply(epsilon_i, 2, mean))/mean(apply(epsilon_i, 1, var))
+print(paste("The pooling factor is equal to: ", pooling_factor))
+```
+
+Based on this pooling factor, we conclude that there is minimal information-sharing between firms
+in the model.
+
+# Extension: Allowing the relationship between complexity and audit fees to vary across firms
+
+We extend the initial model to allow the relationship between firm complexity and audit fees to vary across firms. This yields the following model specification: 
+
+$$
+\begin{aligned}
+LN(AF_{it}) &\sim N(\mu_{it},\sigma) \\
+\mu_{it} &= \alpha_{i}  + \beta_{ARC,i} \cdot LN(ARC)_{it}^{std}
++ \beta_{TA} \cdot LN(TA)_{it}^{std},\\
+\alpha_i &\sim \mathrm{Normal}(13.892,1.299) \\
+\beta_{ARC,i} &\sim \mathrm{Normal}(\mu_{\beta_{ARC}},\sigma_{\beta_{ARC}})\\
+\beta_{TA} &\sim \mathrm{Normal}(0,1) \\
+\mu_{\beta_{ARC}} &\sim \mathrm{Normal}(0,1) \\
+\sigma_{\beta_{ARC}} &\sim \mathrm{Normal}^{+}(0,1) \\
+\sigma &\sim \mathrm{Normal}^{+}(0,1).
+\end{aligned}
+$$
+
+In Rstan, we can represent this model specification using the following code. 
+
+```{r model specification 3, warning = FALSE, message = FALSE, results = 'hide'}
+specmodel3 <- "
+data {
+    int<lower=0> N;                 // number of observations
+    int<lower=0> J;                 // number of firms
+    int<lower=1, upper=J> firm[N];  // firm ID
+    matrix[N, 2] x;                 // predictor matrix with ARC and TA
+    vector[N] AF;                   // dependent variables
+}
+parameters {
+    vector[J] alpha;               // firm-specific intercepts 
+    real mu_beta_ARC;              // population mean ARC slope
+    real<lower=0> sigma_beta_ARC;  // between-firm SD of ARC slopes
+    vector[J] beta_ARC_raw;        // non-centered parameterization for slopes
+    real beta_TA;                  // coefficient for TA
+    real<lower=0> sigma;           // standard deviation of the residuals 
+}
+transformed parameters {
+    // non-centered parameterization for varying ARC slope
+    vector[J] beta_ARC = mu_beta_ARC + sigma_beta_ARC * beta_ARC_raw;
+}
+model {
+    // data model
+    vector[N] mu;
+    for (i in 1:N) {
+        mu[i] = alpha[firm[i]]
+                + beta_ARC[firm[i]] * x[i, 1]
+                + beta_TA * x[i, 2];
+    }
+    AF ~ normal(mu, sigma);
+    // prior distributions
+    alpha          ~ normal(13.892, 1.299);
+    mu_beta_ARC    ~ normal(0, 1);
+    sigma_beta_ARC ~ normal(0, 1);
+    beta_ARC_raw   ~ normal(0, 1);
+    beta_TA        ~ normal(0, 1);
+    sigma          ~ normal(0, 1);
+}
+generated quantities {
+    // posterior predictive simulations 
+    vector[N] AF_sim;
+    
+    // log-likelihood for LOO-CV
+    vector[N] log_lik;
+    for (i in 1:N) {
+        AF_sim[i]  = normal_rng(
+            alpha[firm[i]] + beta_ARC[firm[i]] * x[i, 1] + beta_TA * x[i, 2],
+            sigma);
+        log_lik[i] = normal_lpdf(
+            AF[i] |
+            alpha[firm[i]] + beta_ARC[firm[i]] * x[i, 1] + beta_TA * x[i, 2],
+            sigma);
+    }
+}
+"
+
+model3 <- stan_model(model_code = specmodel3)
+```
+
+To inspect the relation between firm complexity and audit fees at the firm level, we make an exploratory visualiztion. 
+
+```{r visualization firm-level slopes, echo = FALSE}
+# plot relation between arc and audit fees for 9 firms 
+set.seed(18)
+firms <- sample(unique(final_data$FirmNumber), 9)
+
+plot_data <- final_data %>%
+  filter(FirmNumber %in% firms)
+
+expl_vis <- ggplot(plot_data, aes(x = log(ARC), y = log(AuditFeesUSD))) +
+  geom_smooth(method = "lm", se = FALSE, color = "#6497b1", linetype = "dashed", linewidth = 0.5) +
+  geom_point(color = "#03396c") +
+
+  facet_wrap(~ FirmNumber, scales = "free", 
+             labeller = labeller(FirmNumber = function(x) paste("Firm", x))) +
+  labs(
+    x = "Log Accounting Reporting Complexity (ARC)",
+    y = "Log Audit Fees"
+  ) +
+  theme_classic()
+
+print(expl_vis)
+```
+
+```{r, include = FALSE}
+ggsave(expl_vis, filename = "exploratory.png", width = 8, height = 6)
+```
+
+
+The visualization shows that the relation might not be identical for every firm, although there is limited data available for some firms. This makes a model with firm-specific slopes theoretically appealing, while also motivating information sharing across firms to improve estimation for firms with fewer observations.
+
+## Is the model consistent with domain knowledge?
+
+To assess whether the model is consistent with domain knowledge, we generate a prior predictive distribution. 
+
+```{r prior predictive model 3, results = 'hide', warning = FALSE, message = FALSE, echo = FALSE}
+specmodel3_pp <- "
+data {
+    int<lower=0> N;
+    int<lower=0> J;
+    int<lower=1, upper=J> firm[N];
+    matrix[N, 2] x;
+}
+parameters {
+    vector[J] alpha;               // fixed firm intercepts — no pooling
+    real mu_beta_ARC;              // population mean ARC slope
+    real<lower=0> sigma_beta_ARC;  // between-firm SD of ARC slopes
+    vector[J] beta_ARC_raw;        // non-centered slopes
+    real beta_TA;
+    real<lower=0> sigma;
+}
+transformed parameters {
+    // Random slopes — partially pooled
+    vector[J] beta_ARC = mu_beta_ARC + sigma_beta_ARC * beta_ARC_raw;
+}
+model {
+    vector[N] mu;
+    for (i in 1:N) {
+        mu[i] = alpha[firm[i]]
+                + beta_ARC[firm[i]] * x[i, 1]
+                + beta_TA * x[i, 2];
+    }
+    // AF ~ normal(mu, sigma);
+
+    // Fixed intercepts — independent priors, no pooling
+    alpha          ~ normal(13.892, 1.299);
+
+    // Random slopes — hierarchical prior
+    mu_beta_ARC    ~ normal(0, 1);
+    sigma_beta_ARC ~ normal(0, 1);
+    beta_ARC_raw   ~ normal(0, 1);
+
+    beta_TA        ~ normal(0, 1);
+    sigma          ~ normal(0, 1);
+}
+generated quantities {
+    vector[N] AF_sim;
+    // vector[N] log_lik;
+    for (i in 1:N) {
+        AF_sim[i]  = normal_rng(
+            alpha[firm[i]] + beta_ARC[firm[i]] * x[i, 1] + beta_TA * x[i, 2],
+            sigma);
+       // log_lik[i] = normal_lpdf(
+       //    AF[i] |
+       //    alpha[firm[i]] + beta_ARC[firm[i]] * x[i, 1] + beta_TA * x[i, 2],
+       //    sigma);
+    }
+}
+"
+
+model3_pp <- stan_model(model_code = specmodel3_pp)
+
+
+fit3_pp <- rstan::sampling(model3_pp, data = list(N = nrow(final_data), 
+                                           J = length(unique(final_data$FirmNumber)), 
+                                           firm = final_data$FirmNumber,
+                                           x = cbind(ARC_transformed, TA_transformed)),
+                             iter = 10000, chains = 4, refresh = 0, seed = 321, 
+                             cores = 4, warmup = 2000)
+
+
+AF_sim_3 <- as.vector(rstan::extract(fit3_pp)$AF_sim)
+
+pp_3 <- ggplot() +
+  geom_histogram(
+    data = data.frame(AF_sim = AF_sim_3),
+    aes(x = AF_sim),
+    fill = "#6497b1",
+    color = "#03396c",
+    breaks = breaks
+  )+
+  theme_classic() + 
+    scale_x_continuous(
+    breaks = log(c(1, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12)),
+    labels = c("$1", "$10", "$100", "$1K", "$10K", "$100K", "$1M", "$10M", "$100M", "$1B", "$10B", "$100B", "$1T")
+  ) +
+  coord_cartesian(xlim = range(log(final_data$AuditFeesUSD)) + c(-10, 10)) +
+  # add vertical lines for observed data range
+  labs(x = "Audit Fees (log scale, dollar labels)", y = "") +
+  geom_vline(xintercept = log(c(1000, 200000000)), color = "red", linetype = "dashed") +
+  theme(text = element_text(size = 14), axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+outside_range_3 <- sum(AF_sim_3 < log(1000) | AF_sim_3 > log(200000000)) /
+  length(AF_sim_3)
+
+print(pp_3)
+```
+```{r, echo = FALSE}
+print(paste("Proportion of simulated audit fees outside the plausible range: ",
+            round(outside_range_3, 4)))
+```
+
+
+Again, the prior predictive distribution shows that the model is consistent with our domain expertise. 
+
+```{r, include = FALSE}
+ggsave(pp_3, filename = "prior_predictive_distribution_model3.png", width = 8, height = 6)
+```
+
+## Is the posterior approximation sufficiently accurate?
+
+To assess whether the posterior approximation is sufficiently accurate, we inspect the model fit summary and make pairs plots. 
+
+```{r fit model 3, echo = FALSE, results = 'hide'}
+fit3 <- rstan::sampling(
+  model3, 
+  data = list(N = nrow(final_data), 
+              J = length(unique(final_data$FirmNumber)), 
+              firm = final_data$FirmNumber,
+              x = cbind(ARC_transformed, TA_transformed),
+              AF = log(final_data$AuditFeesUSD)),
+  iter = 10000, chains = 4, refresh = 0, seed = 321,  cores = 4, warmup = 2000, 
+  control = list(adapt_delta = 0.99, max_treedepth = 17)) 
+```
+
+```{r, echo = FALSE}
+print(fit3, pars = c("mu_beta_ARC", "sigma_beta_ARC", "beta_TA", "sigma"),
+  probs = c(0.025, 0.5, 0.975))
+```
+
+```{r pairs plot model 3, echo = FALSE}
+pairs3 <- mcmc_pairs(
+  fit3,
+  pars = c("beta_TA", "mu_beta_ARC", "sigma_beta_ARC", "sigma")
+)
+
+print(pairs3)
+```
+Based on the model fit summary and the pairs plot, the model estimation seems to be trustworthy. To verify this more thoroughly, we also provide the results of the simulation-based calibration (SBC). 
+
+```{r, include = FALSE}
+ggsave(pairs3, filename = "pairs_model3.png", width = 12, height = 6)
+```
+
+```{r sbc model 3, echo = FALSE}
+load("sbc_results3.RData")
+
+ggplot(results_long, aes(x = rank)) +
+  geom_histogram(
+  fill = "lightblue",
+  color = "black", 
+  breaks = seq(0, n_posterior_draws, by = 10)
+  ) +
+  facet_wrap(~ parameter) +
+  coord_cartesian(xlim = c(0, n_posterior_draws)) +
+  labs(
+    title = "SBC Rank Histograms",
+    x = "Rank statistic",
+    y = "Count"
+  ) +
+  theme_classic() +
+  theme(
+    text = element_text(family = "serif", size = 18)
+  ) + 
+  geom_hline(aes(yintercept = 50), linetype = "dotted")
+```
+
+The histograms are approximately uniform. There are some slight deviations from the uniform distribution, but these are to be expected given that SBC procedure was based on 500 simulations. 
+
+##  Does the model reproduce the relevant patterns in the data?
+
+To assess whether the model reproduces the relevant patterns in the observed data, we inspect the posterior predictive distribution. 
+
+```{r posterior predictive model 3, echo = FALSE}
+y_rep3 <- rstan::extract(fit3)$AF_sim
+ppc3 <- ppc_dens_overlay(log(final_data$AuditFeesUSD), y_rep3[1:100, ]) + 
+  xlab("Log Audit Fees")
+print(ppc3)
+```
+
+```{r, include = FALSE}
+ggsave(ppc3, filename = "ppc3.png", width = 6, height = 3)
+```
+
+Upon close inspection, this model seems to reproduce the features of the observed data a bit better than the earlier models, but the differences are marginal. To get a better idea about the model fit in relation to the other models, we perform LOO-CV model comparison. 
+
+```{r loocv all models, echo = FALSE, warning = FALSE}
+loglik3 <- loo::extract_log_lik(fit3, parameter_name = "log_lik")
+loo3 <- loo(loglik3, moment_match = TRUE)
+loo3_mm <- loo_moment_match(fit3, loo3)
+
+comparison <- loo_compare(loo1_mm, loo2_mm, loo3_mm)
+
+kable(comparison[,c(1:4,7,8)])
+```
+
+Finally, we calculate the pooling factor for this model, which measures the extent to which information about the slope estimate for firm complexity is shared across firms. We first calculate the firm-specific deviations from the population-level slope for each posterior draw,
+
+$$
+\epsilon_i = \beta_{ARC,i} - \mu_{\beta_{ARC}}.
+$$
+
+We then calculate two quantities. First, for each firm $i$, we calculate the posterior mean of $\epsilon_i$, $E(\epsilon_i)$, and then calculate the variance of these 119 firm-specific posterior means. Second, for each posterior draw, we calculate the variance of $\epsilon_i$ across the 119 firms and then take the average of these variances across the 32,000 posterior draws.
+
+The pooling factor is then calculated as
+
+$$
+\lambda = 1-\frac{\operatorname{Var}(E(\epsilon_i))}
+{E[\operatorname{Var}(\epsilon_i)]}.
+$$
+
+For more information, we refer to Gelman & Pardoe (2006). 
+
+```{r pooling factor model 3, include = FALSE}
+samples <- rstan::extract(fit3)
+theta_i <- samples$beta_ARC
+mu <- samples$mu_beta_ARC
+epsilon_i <- sweep(theta_i, 1, mu, "-")
+pooling_factor <- 1 - var(apply(epsilon_i, 2, mean))/mean(apply(epsilon_i, 1, var))
+print(paste("The pooling factor is equal to: ", pooling_factor))
+```
+
+Based on this pooling factor, we conclude that the slopes share substantial information about the relation between complexity and audit fees, while still exhibiting meaningful firm-specific differences.
+
+# References
+
+Gelman, A., & Pardoe, I. (2006). Bayesian measures of explained variance and pooling in multilevel (hierarchical) models. Technometrics, 48(2), 241-251.
+
