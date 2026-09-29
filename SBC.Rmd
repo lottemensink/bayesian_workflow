@@ -1,0 +1,659 @@
+---
+title: "Simulation-based Calibration"
+output: html_document
+date: "2026-09-26"
+---
+
+```{r, include = FALSE}
+library(dplyr)
+library(stringr)
+library(stringdist)
+library(rstan)
+library(ggplot2)
+library(bayesplot)
+library(gridExtra)
+library(loo)
+library(tidyverse)
+library(ggpubr)
+library(brms)
+library(knitr)
+```
+
+```{r preprocessing, include = FALSE}
+# load data extracted from Edgar (firms, audit fees, total assets, etc.)
+data_fees <- read.csv("EdgarUSD.csv")
+data_fees$adsh <- data_fees$accession_number
+# load audit complexity data from XBRL Research
+data_compl <- read.csv("ARC.csv", sep = ";")
+# filter the 20-F statements out of the complexity data
+data_compl <- data_compl[data_compl$form == "20-F", ]
+# join the complexity data to the audit fee data using adsh
+merged_data <- data_fees %>%
+  inner_join(data_compl, by = "adsh")
+# omit NA's
+filtered_data1 <- na.omit(merged_data)
+# clean entity names
+entity_clean <- filtered_data1$EntityName |>
+  str_to_upper() |>
+  str_replace_all("[[:punct:]]", " ") |>
+  str_replace_all("\\bLIMITED\\b", "LTD") |>
+  str_squish()
+# create mapping for double entity names
+crosswalk <- c(
+  "INTERCONTINENTAL HOTELS GROUP PLC NEW" = "INTERCONTINENTAL HOTELS GROUP PLC",
+  "TELEFÓNICA S A" = "TELEFONICA S A",
+  "CHINA SOUTHERN AIRLINES CO LTD" = "CHINA SOUTHERN AIRLINES COMPANY LTD",
+  "SINOPEC SHANGHAI PETROCHEMICAL COMPANY LTD" = "SINOPEC SHANGHAI PETROCHEMICAL CO LTD", 
+  "AEGON LTD" = "AEGON NV", 
+  "CHINA PETROLEUM CHEMICAL CORP" = "CHINA PETROLEUM CHEMICAL CORPORATION", 
+  "COCA COLA EUROPEAN PARTNERS PLC" = "COCA COLA EUROPACIFIC PARTNERS PLC", 
+  "FRESENIUS MEDICAL CARE AG CO KGAA" = "FRESENIUS MEDICAL CARE AG", 
+  "GUANGSHEN RAILWAY COMPANY LTD" = "GUANGSHEN RAILWAY CO LTD", 
+  "VODAFONE GROUP PUBLIC LTD COMPANY" = "VODAFONE GROUP PUBLIC LTD CO", 
+  "ROYAL DUTCH SHELL PLC" = "SHELL PLC", 
+  "CHINA LIFE INSURANCE COMPANY LTD" = "CHINA LIFE INSURANCE CO LTD", 
+  "GLAXOSMITHKLINE PLC" = "GSK PLC",
+  "EQUINOR ASA" = "STATOIL ASA", 
+  "PRANA BIOTECHNOLOGY LTD" = "ALTERITY THERAPEUTICS LTD", 
+  "BHP BILLITON LTD" = "BHP GROUP LTD"
+)
+# recode entity names using the mapping
+filtered_data1$EntityName_clean <-
+  dplyr::recode(entity_clean, !!!crosswalk)
+
+# remove negative observations for TA and audit fees
+filtered_data2 <- filtered_data1 %>%
+  filter(AuditFeesUSD > 0 & TotalAssetsUSD > 0)
+
+# code entity name clean as category
+filtered_data2$Firm <- as.factor(filtered_data2$EntityName_clean)
+
+# keep only the columns audit fees, ARC, Firm & TA
+filtered_data2 <- filtered_data2 %>%
+  select(adsh, AuditFeesUSD, ARC, Firm, TotalAssetsUSD, AuditFees, FiscalYearFocus, EntityName_clean) 
+
+# remove observations based on manual checking with records
+to_remove <- c("0001956827-25-000010", "0001292814-25-000697", "0001493152-22-024334",
+               "0000835403-20-000006", "0000835403-19-000005", "0001193125-20-065064",
+               "0001104659-26-035163", "0001558370-25-003806", "0001628280-25-015363", 
+               "0001062993-23-013696", "0001047469-21-000424", "0000217410-26-000007", 
+               "0000217410-24-000017", "0000217410-25-000015", "0000217410-23-000016", 
+               "0000217410-22-000009", "0001193125-21-075770", "0001193125-20-067343", 
+               "0001193125-19-070417", "0001558370-20-003378", "0001213900-22-066882",
+               "0001193125-20-128655", "0001193125-19-121544", "0001193125-18-141442", 
+               "0000919574-20-002350", "0001104659-24-038836", "0001193125-26-194102")
+
+# correct audit fees based on manual checking with records
+filtered_data2[filtered_data2$adsh == "0001213900-25-044434", "AuditFeesUSD"] <- 220740
+filtered_data2[filtered_data2$adsh == "0001213900-24-062719", "AuditFeesUSD"] <- 203000
+filtered_data2[filtered_data2$adsh == "0001213900-24-043254", "AuditFeesUSD"] <- 210000
+filtered_data2[filtered_data2$adsh == "0001213900-22-026185", "AuditFeesUSD"] <- 250000
+
+# remove adsh from final data 
+filtered_data3 <- filtered_data2[!filtered_data2$adsh %in% to_remove, ]
+
+final_data <- filtered_data3 %>%
+  group_by(Firm) %>%
+  filter(n() > 1) %>%
+  ungroup()
+
+final_data$Firm <- droplevels(final_data$Firm)
+final_data$FirmNumber <- as.numeric(final_data$Firm)
+
+TA_transformed <- (log(final_data$TotalAssetsUSD) - mean(log(final_data$TotalAssetsUSD))) / sd(log(final_data$TotalAssetsUSD))
+ARC_transformed <- (log(final_data$ARC) - mean(log(final_data$ARC))) / sd(log(final_data$ARC))
+```
+
+```{r sbc1, cache = TRUE}
+set.seed(124)
+
+specmodel1 <- "data {
+    int<lower=0> N;                   // number of observations
+    int<lower=0> K;                   // number of predictors
+    int<lower=0> J;                   // number of firms
+    int<lower=1, upper=J> firm[N];    // firm ID
+    matrix[N, K] x;                   // predictor matrix with ARC and TA    
+    vector[N] AF;                     // dependent variable
+  }
+  
+  parameters {
+    vector[J] alpha;                  // firm-specific intercepts
+    vector[K] beta;                   // coefficients for predictors
+    real<lower=0> sigma;              // standard deviation of the residuals
+  }
+  
+  model {
+    // data model
+    AF ~ normal(alpha[firm] + x * beta, sigma);
+    // prior distributions
+    alpha ~ normal(13.892, 1.299); 
+    beta ~ normal(0,1);
+    sigma ~ normal(0,1);
+  }
+  
+  generated quantities { 
+  // posterior predictive simulations
+  vector[N] AF_sim;
+  
+  // log-likelihood for LOO-CV
+  vector[N] log_lik;
+  
+  for (i in 1:N){
+    AF_sim[i] = normal_rng(alpha[firm[i]] + x[i, ] * beta, sigma);
+    log_lik[i] = normal_lpdf(AF[i] | alpha[firm[i]] + x[i, ] * beta, sigma);
+  }
+  }
+"
+
+model1 <- rstan::stan_model(model_code = specmodel1)
+
+n_reps <- 500
+n_posterior_draws <- 100
+
+parameter_names <- c("beta[1]", "beta[2]", "sigma")
+
+results <- as.data.frame(matrix(NA, nrow = n_reps, ncol = length(parameter_names)))
+colnames(results) <- parameter_names
+true_parameter_storage <- results
+
+diagnostics <- data.frame(
+  rep = 1:n_reps,
+  max_rhat = NA_real_,
+  min_ess = NA_real_,
+  n_divergent = NA_integer_
+)
+
+for (i in 1:n_reps) {
+
+  alpha <- rnorm(length(unique(final_data$FirmNumber)), 13.892, 1.299)
+  beta <- rnorm(2, 0, 1)
+  sigma <- abs(rnorm(1, 0, 1))
+
+  true_parameters <- c(beta[1], beta[2], sigma)
+  true_parameter_storage[i, ] <- true_parameters
+
+
+  AF_sbc <- c()
+
+  for (j in 1:nrow(final_data)) {
+    AF_sbc[j] <- rnorm(
+      1,
+      alpha[final_data$FirmNumber[j]] +
+        cbind(TA_transformed, ARC_transformed)[j, ] %*% beta,
+      sigma
+    )
+  }
+
+
+  fit <- rstan::sampling(
+    model1,
+    data = list(
+      N = nrow(final_data),
+      K = 2,
+      J = length(unique(final_data$FirmNumber)),
+      firm = final_data$FirmNumber,
+      x = cbind(TA_transformed, ARC_transformed),
+      AF = AF_sbc
+    ),
+    iter = 5000,
+    chains = 4,
+    refresh = 0,
+    seed = 123,
+    cores = 4,
+    control = list(
+      adapt_delta = 0.99,
+      max_treedepth = 17
+    )
+  )
+
+
+  # Store diagnostics
+  fit_summary <- summary(fit)$summary
+
+  diagnostics$max_rhat[i] <- max(
+    fit_summary[, "Rhat"],
+    na.rm = TRUE
+  )
+
+  diagnostics$min_ess[i] <- min(
+    fit_summary[, "n_eff"],
+    na.rm = TRUE
+  )
+
+  sampler_params <- get_sampler_params(
+    fit,
+    inc_warmup = FALSE
+  )
+
+  diagnostics$n_divergent[i] <- sum(
+    sapply(
+      sampler_params,
+      function(x) sum(x[, "divergent__"])
+    )
+  )
+
+
+  # Calculate SBC statistics
+  for (k in seq_along(parameter_names)) {
+
+    posterior_draws <- as.matrix(fit)[, parameter_names[k]]
+
+    # Rank statistic (using selected draws)
+    indices <- round(
+      seq(1, length(posterior_draws),
+          length.out = n_posterior_draws)
+    )
+
+    posterior_selected <- posterior_draws[indices]
+
+    results[i, k] <- sum(
+      posterior_selected < true_parameters[k]
+    )
+  }
+}
+
+results_long <- pivot_longer(
+  results,
+  cols = everything(),
+  names_to = "parameter",
+  values_to = "rank"
+)
+
+
+ggplot(results_long, aes(x = rank)) +
+  geom_histogram(
+  fill = "lightblue",
+  color = "black", 
+  breaks = seq(0, n_posterior_draws, by = 10)
+  ) +
+  facet_wrap(~ parameter) +
+  coord_cartesian(xlim = c(0, n_posterior_draws)) +
+  labs(
+    title = "SBC Rank Histograms",
+    x = "Rank statistic",
+    y = "Count"
+  ) +
+  theme_classic() +
+  theme(
+    text = element_text(family = "Times New Roman", size = 18)
+  )
+
+save(results_long, diagnostics, true_parameter_storage, file = "sbc_results1.RData")
+```
+
+
+```{r sbc2, cache = TRUE}
+specmodel2 <- "data {
+    int<lower=0> N;       // number of observations
+    int<lower=0> K;       // number of predictors
+    int<lower=0> J;       // number of firms
+    int<lower=1, upper=J> firm[N]; // firm
+    matrix[N, K] x;       // predictor matrix    
+    vector[N] AF;         // dependent variable
+  }
+  
+  parameters {
+    vector[J] alpha;
+    vector[K] beta;           // coefficients for predictors
+    real<lower=0> sigma;
+    real mu_alpha;           // hyperparameter for alpha
+    real<lower=0> sigma_alpha; // hyperparameter for alpha
+  }
+  
+  model {
+    AF ~ normal(alpha[firm] + x * beta, sigma);
+    alpha ~ normal(mu_alpha, sigma_alpha); 
+    beta ~ normal(0,1);
+    sigma ~ normal(0,1);
+    mu_alpha ~ normal(13.892, 1.299);
+    sigma_alpha ~ normal(0, 1);
+  }
+  generated quantities { 
+  vector[N] AF_sim;
+  vector[N] log_lik;
+  
+  for (i in 1:N){
+    AF_sim[i] = normal_rng(alpha[firm[i]] + x[i, ] * beta, sigma);
+    log_lik[i] = normal_lpdf(AF[i] | alpha[firm[i]] + x[i, ] * beta, sigma);
+  }
+  }
+"
+
+model2 <- rstan::stan_model(model_code = specmodel2)
+
+n_reps <- 500
+n_posterior_draws <- 100
+
+parameter_names <- c("mu_alpha", "beta[1]", "beta[2]", "sigma_alpha", "sigma")
+
+results <- as.data.frame(matrix(NA, nrow = n_reps, ncol = length(parameter_names)))
+colnames(results) <- parameter_names
+
+true_parameter_storage <- results
+
+diagnostics <- data.frame(
+  rep = 1:n_reps,
+  max_rhat = NA_real_,
+  min_ess = NA_real_,
+  n_divergent = NA_integer_
+)
+
+
+for (i in 1:n_reps) {
+
+  mu_alpha <- rnorm(1, 13.892, 1.299)
+  beta <- rnorm(2, 0, 1)
+  sigma <- abs(rnorm(1, 0, 1))
+  sigma_alpha <- abs(rnorm(1, 0, 1))
+
+  alpha <- rnorm(length(unique(final_data$FirmNumber)), mu_alpha, sigma_alpha)
+
+  true_parameters <- c(mu_alpha, beta[1], beta[2], sigma_alpha, sigma)
+  true_parameter_storage[i, ] <- true_parameters
+
+  AF_sbc <- c()
+
+  for (j in 1:nrow(final_data)) {
+    AF_sbc[j] <- rnorm(
+      1,
+      alpha[final_data$FirmNumber[j]] +
+        cbind(TA_transformed, ARC_transformed)[j, ] %*% beta,
+      sigma
+    )
+  }
+
+
+  fit <- rstan::sampling(
+    model2,
+    data = list(
+      N = nrow(final_data),
+      K = 2,
+      J = length(unique(final_data$FirmNumber)),
+      firm = final_data$FirmNumber,
+      x = cbind(TA_transformed, ARC_transformed),
+      AF = AF_sbc
+    ),
+    iter = 5000,
+    chains = 4,
+    refresh = 0,
+    seed = 123,
+    cores = 4,
+    control = list(
+      adapt_delta = 0.99,
+      max_treedepth = 17
+    )
+  )
+
+
+  # Store diagnostics
+  fit_summary <- summary(fit)$summary
+
+  diagnostics$max_rhat[i] <- max(
+    fit_summary[, "Rhat"],
+    na.rm = TRUE
+  )
+
+  diagnostics$min_ess[i] <- min(
+    fit_summary[, "n_eff"],
+    na.rm = TRUE
+  )
+
+  sampler_params <- get_sampler_params(
+    fit,
+    inc_warmup = FALSE
+  )
+
+  diagnostics$n_divergent[i] <- sum(
+    sapply(
+      sampler_params,
+      function(x) sum(x[, "divergent__"])
+    )
+  )
+
+
+  # Calculate SBC statistics
+  for (k in seq_along(parameter_names)) {
+
+    posterior_draws <- as.matrix(fit)[, parameter_names[k]]
+
+    # Rank statistic (using selected draws)
+    indices <- round(
+      seq(1, length(posterior_draws),
+          length.out = n_posterior_draws)
+    )
+
+    posterior_selected <- posterior_draws[indices]
+
+    results[i, k] <- sum(
+      posterior_selected < true_parameters[k]
+    )
+  }
+}
+
+results_long <- pivot_longer(
+  results,
+  cols = everything(),
+  names_to = "parameter",
+  values_to = "rank"
+)
+
+ggplot(results_long, aes(x = rank)) +
+  geom_histogram(
+  breaks = seq(0, n_posterior_draws, by = 10),
+  fill = "lightblue",
+  color = "black"
+  ) +
+  facet_wrap(~ parameter) +
+  coord_cartesian(xlim = c(0, n_posterior_draws)) +
+  labs(
+    title = "SBC Rank Histograms",
+    x = "Rank statistic",
+    y = "Count"
+  ) +
+  theme_classic() +
+  theme(
+    text = element_text(family = "Times New Roman", size = 18)
+  )
+
+save(results_long, diagnostics, true_parameter_storage, file = "sbc_results2.RData")
+```
+
+
+```{r sbc3, cache = TRUE}
+specmodel3 <- "
+data {
+    int<lower=0> N;
+    int<lower=0> J;
+    int<lower=1, upper=J> firm[N];
+    matrix[N, 2] x;
+    vector[N] AF;
+}
+parameters {
+    vector[J] alpha;               // fixed firm intercepts — no pooling
+    real mu_beta_ARC;              // population mean ARC slope
+    real<lower=0> sigma_beta_ARC;  // between-firm SD of ARC slopes
+    vector[J] beta_ARC_raw;        // non-centered slopes
+    real beta_TA;
+    real<lower=0> sigma;
+}
+transformed parameters {
+    // Random slopes — partially pooled
+    vector[J] beta_ARC = mu_beta_ARC + sigma_beta_ARC * beta_ARC_raw;
+}
+model {
+    vector[N] mu;
+    for (i in 1:N) {
+        mu[i] = alpha[firm[i]]
+                + beta_ARC[firm[i]] * x[i, 1]
+                + beta_TA * x[i, 2];
+    }
+    AF ~ normal(mu, sigma);
+
+    // Fixed intercepts — independent priors, no pooling
+    alpha          ~ normal(13.892, 1.299);
+
+    // Random slopes — hierarchical prior
+    mu_beta_ARC    ~ normal(0, 1);
+    sigma_beta_ARC ~ normal(0, 1);
+    beta_ARC_raw   ~ normal(0, 1);
+
+    beta_TA        ~ normal(0, 1);
+    sigma          ~ normal(0, 1);
+}
+generated quantities {
+    vector[N] AF_sim;
+    vector[N] log_lik;
+    for (i in 1:N) {
+        AF_sim[i]  = normal_rng(
+            alpha[firm[i]] + beta_ARC[firm[i]] * x[i, 1] + beta_TA * x[i, 2],
+            sigma);
+        log_lik[i] = normal_lpdf(
+            AF[i] |
+            alpha[firm[i]] + beta_ARC[firm[i]] * x[i, 1] + beta_TA * x[i, 2],
+            sigma);
+    }
+}
+"
+
+model3 <- stan_model(model_code = specmodel3)
+
+n_reps <- 500
+n_posterior_draws <- 100
+
+parameter_names <- c("mu_beta_ARC", "sigma_beta_ARC", "beta_TA", "sigma")
+
+results <- as.data.frame(matrix(NA, nrow = n_reps, ncol = length(parameter_names)))
+colnames(results) <- parameter_names
+
+true_parameter_storage <- results
+
+diagnostics <- data.frame(
+  rep = 1:n_reps,
+  max_rhat = NA_real_,
+  min_ess = NA_real_,
+  n_divergent = NA_integer_
+)
+
+
+for (i in 1:n_reps) {
+  
+  beta_TA <- rnorm(1, 0, 1)
+  mu_beta_ARC <- rnorm(1, 0, 1)
+  sigma_beta_ARC <- abs(rnorm(1, 0, 1))
+  sigma <- abs(rnorm(1, 0, 1))
+
+  alpha <- rnorm(length(unique(final_data$FirmNumber)), 13.892, 1.299)
+  beta_ARC <- rnorm(length(unique(final_data$FirmNumber)), mu_beta_ARC, sigma_beta_ARC)
+
+  true_parameters <- c(mu_beta_ARC, sigma_beta_ARC, beta_TA, sigma)
+  true_parameter_storage[i, ] <- true_parameters
+
+  AF_sbc <- c()
+
+  for (j in 1:nrow(final_data)) {
+    AF_sbc[j] <- rnorm(
+      1,
+      alpha[final_data$FirmNumber[j]] + 
+        beta_ARC[final_data$FirmNumber[j]] * ARC_transformed[j] +
+        beta_TA * TA_transformed[j],
+      sigma
+    )
+  }
+
+
+  fit <- rstan::sampling(
+    model3,
+    data = list(
+      N = nrow(final_data),
+      K = 2,
+      J = length(unique(final_data$FirmNumber)),
+      firm = final_data$FirmNumber,
+      x = cbind(ARC_transformed, TA_transformed),
+      AF = AF_sbc
+    ),
+    iter = 5000,
+    chains = 4,
+    refresh = 0,
+    seed = 123,
+    cores = 4,
+    control = list(
+      adapt_delta = 0.99,
+      max_treedepth = 17
+    )
+  )
+
+
+  # Store diagnostics
+  fit_summary <- summary(fit)$summary
+
+  diagnostics$max_rhat[i] <- max(
+    fit_summary[, "Rhat"],
+    na.rm = TRUE
+  )
+
+  diagnostics$min_ess[i] <- min(
+    fit_summary[, "n_eff"],
+    na.rm = TRUE
+  )
+
+  sampler_params <- get_sampler_params(
+    fit,
+    inc_warmup = FALSE
+  )
+
+  diagnostics$n_divergent[i] <- sum(
+    sapply(
+      sampler_params,
+      function(x) sum(x[, "divergent__"])
+    )
+  )
+
+
+  # Calculate SBC statistics
+  for (k in seq_along(parameter_names)) {
+
+    posterior_draws <- as.matrix(fit)[, parameter_names[k]]
+
+    # Rank statistic (using selected draws)
+    indices <- round(
+      seq(1, length(posterior_draws),
+          length.out = n_posterior_draws)
+    )
+
+    posterior_selected <- posterior_draws[indices]
+
+    results[i, k] <- sum(
+      posterior_selected < true_parameters[k]
+    )
+  }
+}
+
+results_long <- pivot_longer(
+  results,
+  cols = everything(),
+  
+  names_to = "parameter",
+  values_to = "rank"
+)
+
+ggplot(results_long, aes(x = rank)) +
+  geom_histogram(
+  breaks = seq(0, n_posterior_draws, by = 10),
+  fill = "lightblue",
+  color = "black"
+  ) +
+  facet_wrap(~ parameter) +
+  coord_cartesian(xlim = c(0, n_posterior_draws)) +
+  labs(
+    title = "SBC Rank Histograms",
+    x = "Rank statistic",
+    y = "Count"
+  ) +
+  theme_classic() +
+  theme(
+    text = element_text(family = "Times New Roman", size = 18)
+  )
+
+save(results_long, diagnostics, true_parameter_storage, file = "sbc_results3.RData")
+```
+
